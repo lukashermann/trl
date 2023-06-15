@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from datasets import Dataset
+import torch.utils.data
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -47,6 +48,21 @@ class PeftSavingCallback(TrainerCallback):
 
             if "pytorch_model.bin" in os.listdir(checkpoint_path):
                 os.remove(os.path.join(checkpoint_path, "pytorch_model.bin"))
+
+
+class PaddedDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, tokenizer):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+
+    def __getitem__(self, index):
+        return {"input_ids": self.tokenizer(self.dataset[index]["text"], return_tensors="pt", padding=True)["input_ids"]}
+
+    # def __getitems__(self, index):
+    #     return self.__getitem__(index)
+
+    def __len__(self):
+        return len(self.dataset)
 
 
 class SFTTrainer(Trainer):
@@ -123,6 +139,7 @@ class SFTTrainer(Trainer):
         infinite: Optional[bool] = False,
         num_of_sequences: Optional[int] = 1024,
         chars_per_token: Optional[float] = 3.6,
+        use_padded_dataset: Optional[bool] = False 
     ):
         if isinstance(model, str):
             warnings.warn(
@@ -186,6 +203,7 @@ class SFTTrainer(Trainer):
                 infinite,
                 num_of_sequences,
                 chars_per_token,
+                use_padded_dataset,
             )
         if eval_dataset is not None:
             eval_dataset = self._prepare_dataset(
@@ -198,6 +216,7 @@ class SFTTrainer(Trainer):
                 infinite,
                 num_of_sequences,
                 chars_per_token,
+                use_padded_dataset
             )
 
         super().__init__(
@@ -225,8 +244,16 @@ class SFTTrainer(Trainer):
         infinite,
         num_of_sequences,
         chars_per_token,
+        use_padded_dataset
     ):
         # check if torch dataset / dataloader and do nothing
+
+        if use_padded_dataset:
+            dataset = self._prepare_non_packed_dataloader_without_clipping(
+                tokenizer, dataset, dataset_text_field, max_seq_length, formatting_func
+            )
+            return dataset
+
         if dataset is not None and (
             isinstance(
                 dataset,
@@ -287,6 +314,37 @@ class SFTTrainer(Trainer):
             for length, input_ids in zip(outputs["length"], outputs["input_ids"]):
                 if length == max_seq_len:
                     input_batch.append(input_ids)
+
+            if len(input_batch) == 0:
+                # warn users
+                warnings.warn(
+                    f"Found 0 samples with a length of {max_seq_len}. You might want to decrease the `max_seq_len` argument."
+                )
+            return {"input_ids": input_batch}
+
+        tokenized_dataset = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+
+        return tokenized_dataset
+
+    
+    def _prepare_non_packed_dataloader_without_clipping(
+        self, tokenizer, dataset, dataset_text_field, max_seq_len, formatting_func=None
+    ):
+        use_formatting_func = formatting_func is not None and dataset_text_field is None
+
+        # Inspired from: https://huggingface.co/learn/nlp-course/chapter7/6?fw=pt
+        def tokenize(element):
+            outputs = tokenizer(
+                element[dataset_text_field] if not use_formatting_func else formatting_func(element),
+                truncation=True,
+                max_length=max_seq_len,
+                return_overflowing_tokens=False,
+                return_length=True,
+            )
+            input_batch = []
+            for length, input_ids in zip(outputs["length"], outputs["input_ids"]):
+                
+                input_batch.append(input_ids)
 
             if len(input_batch) == 0:
                 # warn users
